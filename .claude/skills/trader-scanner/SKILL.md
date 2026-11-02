@@ -28,9 +28,11 @@ python3 "${CLAUDE_SKILL_DIR}/scan.py" daily --symbols TSLA,NVDA,AMD
 python3 "${CLAUDE_SKILL_DIR}/scan.py" orb
 python3 "${CLAUDE_SKILL_DIR}/scan.py" orb --at 10:15
 python3 "${CLAUDE_SKILL_DIR}/scan.py" orb --watchlist trader/watchlist.json --json
+python3 "${CLAUDE_SKILL_DIR}/scan.py" orb --sector Technology --exchange nasdaq
+python3 "${CLAUDE_SKILL_DIR}/scan.py" daily --industry semiconductor
 ```
 
-`daily` s'utilise avant l'ouverture ou après la clôture ; `orb` après 9 h 50, heure de New York. Paramètres : `--min-price 5`, `--min-volume` (1 000 000 en daily, 0 en orb), `--or-minutes 15`, `--max-confirm 200`, `--now "2026-10-19 10:15"`, `--offline PATH`, `--no-write`, `--show N`, `--json`, `--watchlist FILE`, `--limit 200`.
+`daily` s'utilise avant l'ouverture ou après la clôture ; `orb` après 9 h 50, heure de New York. Paramètres : `--min-price 5`, `--min-volume` (1 000 000 en daily, 0 en orb), `--or-minutes 15`, `--max-confirm 200`, `--now "2026-10-19 10:15"`, `--offline PATH`, `--no-write`, `--show N`, `--json`, `--watchlist FILE`, `--limit 200`, `--sector`, `--industry`, `--exchange`, `--sectors FILE`.
 
 Code de sortie 0 si le scan trouve des résultats, 1 s'il ne trouve rien ou ne peut pas fonctionner. Expliquer la raison, sans inventer de résultat.
 
@@ -41,6 +43,18 @@ Code de sortie 0 si le scan trouve des résultats, 1 s'il ne trouve rien ou ne p
 | `trader/universe.txt` | Écrit par `universe`, une ligne `SYMBOL\|Name` par valeur ; lu par `daily` et `orb`. |
 | `trader/watchlist.json` | Écrit par `daily` et `orb` : `mode`, `as_of`, `universe`, `scanned`, `failed`, `hits[]`. Les skills suivants lisent `hits[].symbol`. |
 | `trader/config.json` | `orb` lit `no_entries_after`, par défaut 15:30. |
+| `trader/sectors.json` | Écrit par `universe` : `symbols.{SYM}` avec `exchange`, `sector`, `industry`, `source` (et `sic` si la SEC a servi). Lu par `--sector`, `--industry` et `--exchange`. |
+
+## Secteurs et place de cotation
+
+`universe` écrit aussi `trader/sectors.json` :
+
+- **Place de cotation** (`nasdaq`, `nyse`, `nyse-american`, `nyse-arca`, `cboe`, `iex`) tirée des fichiers Nasdaq Trader.
+- **Secteur et industrie** tirés du screener Nasdaq (`api.nasdaq.com`, un seul téléchargement). Si l'API refuse la connexion, l'utilisateur peut télécharger le CSV depuis la page « Stock Screener » de nasdaq.com et le passer avec `--screener-file FICHIER.csv`.
+- `--sec-fallback` complète les symboles sans secteur avec le code SIC de la SEC (`data.sec.gov`, une requête par société, pause de 0,15 s). Seules les plages tech (357x, 36xx, 3812, 382x, 737x) donnent un secteur : `Technology`. Les autres codes restent sans secteur, sans supposition. La SEC demande d'indiquer qui fait les requêtes : la variable d'environnement `SEC_USER_AGENT` doit contenir un nom et un e-mail fournis par l'utilisateur. Ne jamais la remplir à sa place.
+- `--no-sectors` saute cette étape.
+
+`daily` et `orb` acceptent ensuite `--sector` (liste séparée par des virgules ; `tech` vaut `Technology`), `--industry` (texte contenu dans l'industrie, ex. `semiconductor`) et `--exchange` (`nasdaq`, `nyse`, `amex`…). Un symbole sans donnée est écarté et compté, jamais deviné. La sortie indique combien de symboles sont gardés, combien manquent de données et la date du fichier ; `watchlist.json` reçoit `sector_filter`. Les secteurs sont ceux du screener Nasdaq : d'autres classifications rangent certaines sociétés ailleurs (GOOGL, META, AMZN, par exemple). Le dire quand on restitue un scan filtré.
 
 ## Construction de l'univers
 

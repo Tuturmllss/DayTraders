@@ -64,13 +64,26 @@ with nasdaqlisted.txt and otherlisted.txt; daily and orb take a folder of
 <T>.json v8 chart files or spark responses, or one file that is a spark
 response, a v8 chart, or a bundle {"TSLA": <v8 json>, ...}. .json.gz is fine.
 
+Sectors   `universe` also writes trader/sectors.json: the listing exchange of
+          every kept symbol (from the Nasdaq Trader files) and its sector and
+          industry from the Nasdaq stock screener (api.nasdaq.com, one request).
+          --sec-fallback fills the symbols the screener leaves blank from the
+          SEC's SIC code (data.sec.gov, one request a company, SEC_USER_AGENT
+          must name you and an email, as the SEC asks). daily and orb then take
+          --sector Technology, --industry semiconductor, --exchange nasdaq.
+          A symbol with no sector data is left out of a sector filter and
+          counted, never guessed. Sector labels are the screener's (or the
+          SIC's), and other sources classify some companies differently.
+
 A scan is a list of charts that match a rule, not a list of stocks to buy.
 Exit code 0 when the scan found something, 1 when it did not or could not run.
 """
 
 import argparse
+import csv
 import datetime
 import gzip
+import io
 import json
 import os
 import re
@@ -91,6 +104,22 @@ BAR_MIN = 5
 MAX_CONFIRM = 200   # stage-2 v8 charts per orb scan, most traded first
 MIN_DAILY_BARS = 30
 DEFAULT_UNIVERSE = "trader/universe.txt"
+DEFAULT_SECTORS = "trader/sectors.json"
+SCREENER_URL = "https://api.nasdaq.com/api/screener/stocks?tableonly=true&download=true"
+SEC_TICKERS_URL = "https://www.sec.gov/files/company_tickers_exchange.json"
+SEC_SUBMISSIONS_URL = "https://data.sec.gov/submissions/CIK%010d.json"
+SEC_PAUSE = 0.15    # the SEC allows 10 requests a second; stay well under
+NASDAQ_MARKET = "nasdaq"
+OTHER_EXCHANGE = {"A": "nyse-american", "N": "nyse", "P": "nyse-arca", "Z": "cboe", "V": "iex"}
+EXCHANGE_ALIASES = {"amex": "nyse-american", "nyse-mkt": "nyse-american", "american": "nyse-american",
+                    "arca": "nyse-arca", "bats": "cboe", "bzx": "cboe"}
+SECTOR_ALIASES = {"tech": "technology", "it": "technology", "information technology": "technology",
+                  "health": "health care", "healthcare": "health care", "financials": "finance",
+                  "financial": "finance", "telecom": "telecommunications", "materials": "basic materials"}
+# SIC codes (SEC) that count as Technology when the screener has no sector:
+# computers and office equipment, electronic components and semiconductors,
+# communications and measuring equipment, software and computer services.
+SIC_TECH = [(3570, 3579), (3600, 3699), (3812, 3812), (3820, 3829), (7370, 7379)]
 NOTE = "A scan is a list of charts that match a rule, not a list of stocks to buy."
 
 NYSE_HOLIDAYS = {
@@ -226,8 +255,8 @@ def day_label(d):
 
 # ---------------------------------------------------------------- network
 
-def http_get(url, timeout=20):
-    req = urllib.request.Request(url, headers={"User-Agent": UA, "Accept": "*/*"})
+def http_get(url, timeout=20, accept="*/*"):
+    req = urllib.request.Request(url, headers={"User-Agent": UA, "Accept": accept})
     with urllib.request.urlopen(req, timeout=timeout) as r:
         return r.read().decode("utf-8", "replace")
 
@@ -462,8 +491,9 @@ def parse_symdir(text):
     return rows, created
 
 
-def build_universe(texts):
-    """{filename: text} -> (kept [(SYM, name)], counts, created)."""
+def build_universe(texts, exchanges=None):
+    """{filename: text} -> (kept [(SYM, name)], counts, created). `exchanges`, if a
+    dict, gets {SYM: exchange} for the kept symbols (nasdaq, nyse, nyse-american...)."""
     kept, counts, created = {}, {}, None
     for fname in NASDAQ_FILES:
         if fname not in texts:
@@ -477,7 +507,151 @@ def build_universe(texts):
             if why == "keep":
                 sym = (r.get("Symbol") or r.get("ACT Symbol")).strip()
                 kept[sym] = " ".join((r.get("Security Name") or "").split())
+                if exchanges is not None:
+                    if fname == "nasdaqlisted.txt":
+                        exchanges[sym] = NASDAQ_MARKET
+                    else:
+                        code = (r.get("Exchange") or "").strip()
+                        exchanges[sym] = OTHER_EXCHANGE.get(code, code.lower() or None)
     return sorted(kept.items()), counts, created
+
+
+# ---------------------------------------------------------------- sectors
+
+def screener_symbol(sym):
+    """Nasdaq screener ticker -> ours: BRK/B -> BRK.B, ABR^D (a preferred) stays odd."""
+    return (sym or "").strip().upper().replace("/", ".")
+
+
+def parse_screener(text_or_doc):
+    """Nasdaq screener JSON -> {SYM: {"sector", "industry"}} (blank values -> None)."""
+    try:
+        doc = json.loads(text_or_doc) if isinstance(text_or_doc, str) else text_or_doc
+        data = doc["data"]
+        rows = data.get("rows") or (data.get("table") or {}).get("rows")
+    except (ValueError, KeyError, TypeError, AttributeError):
+        raise ScanError("the Nasdaq screener answer is not the shape this tool knows")
+    if not isinstance(rows, list) or not rows:
+        raise ScanError("the Nasdaq screener answer has no rows")
+    out = {}
+    for r in rows:
+        sym = screener_symbol(r.get("symbol"))
+        if not sym:
+            continue
+        out[sym] = {"sector": (r.get("sector") or "").strip() or None,
+                    "industry": (r.get("industry") or "").strip() or None}
+    return out
+
+
+def parse_screener_csv(text):
+    """The CSV that nasdaq.com's stock screener page downloads (Symbol, ..., Sector, Industry)."""
+    rows = list(csv.DictReader(io.StringIO(text.lstrip("\ufeff"))))
+    if not rows or not {"Symbol", "Sector"} <= set(rows[0]):
+        raise ScanError("not a Nasdaq screener CSV (it needs Symbol and Sector columns)")
+    return parse_screener({"data": {"rows": [{"symbol": r.get("Symbol"), "sector": r.get("Sector"),
+                                               "industry": r.get("Industry")} for r in rows]}})
+
+
+def read_screener_file(path):
+    if not os.path.exists(path):
+        raise ScanError("no screener file at %s" % path)
+    text = _read_maybe_gz(path)
+    if text.lstrip("\ufeff \n").startswith("{"):
+        return parse_screener(text)
+    return parse_screener_csv(text)
+
+
+def sic_sector(sic):
+    """SIC code -> 'Technology' for the tech ranges, else None (no guess for the rest)."""
+    try:
+        n = int(sic)
+    except (TypeError, ValueError):
+        return None
+    return "Technology" if any(lo <= n <= hi for lo, hi in SIC_TECH) else None
+
+
+def build_sectors(kept, exchanges, screener, sec=None):
+    """kept [(SYM, name)] -> {SYM: {exchange, sector, industry, source[, sic]}}, counts."""
+    out, counts = {}, {"symbols": len(kept), "screener": 0, "sec": 0, "no_sector": 0}
+    for sym, _ in kept:
+        e = {"exchange": exchanges.get(sym), "sector": None, "industry": None, "source": None}
+        row = screener.get(sym)
+        if row and row.get("sector"):
+            e.update(sector=row["sector"], industry=row.get("industry"), source="nasdaq-screener")
+            counts["screener"] += 1
+        elif sec and sym in sec:
+            s = sec[sym]
+            e.update(sic=s.get("sic"), industry=s.get("sic_description"), source="sec-sic")
+            e["sector"] = sic_sector(s.get("sic"))
+            if e["sector"]:
+                counts["sec"] += 1
+        if not e["sector"]:
+            counts["no_sector"] += 1
+        out[sym] = e
+    return out, counts
+
+
+def norm_exchange(x):
+    x = (x or "").strip().lower().replace(" ", "-")
+    return EXCHANGE_ALIASES.get(x, x)
+
+
+def norm_sector(x):
+    x = " ".join((x or "").strip().lower().split())
+    return SECTOR_ALIASES.get(x, x)
+
+
+def split_list(text):
+    return [t for t in (p.strip() for p in (text or "").split(",")) if t]
+
+
+def load_sectors(path):
+    if not os.path.exists(path):
+        raise ScanError("no %s yet: run `scan.py universe` (it writes the sectors file too)" % path)
+    try:
+        with open(path, encoding="utf-8") as fh:
+            doc = json.load(fh)
+    except ValueError as e:
+        raise ScanError("%s is not valid JSON: %s" % (path, e))
+    syms = doc.get("symbols") if isinstance(doc, dict) else None
+    if not isinstance(syms, dict):
+        raise ScanError("%s has no symbols map" % path)
+    return doc, syms
+
+
+def filter_by_sector(symbols, table, sectors=None, industries=None, exchanges=None):
+    """Pure. -> (kept, counts). A symbol missing from the table, or with no sector when a
+    sector or industry is asked, is counted as unknown and left out, never guessed."""
+    want_sec = {norm_sector(s) for s in sectors or []}
+    want_ind = [i.strip().lower() for i in industries or [] if i.strip()]
+    want_ex = {norm_exchange(e) for e in exchanges or []}
+    kept, counts = [], {"in": len(symbols), "kept": 0, "unknown": 0, "other": 0}
+    for sym in symbols:
+        e = table.get(sym)
+        if e is None:
+            counts["unknown"] += 1
+            continue
+        if want_ex:
+            if not e.get("exchange"):
+                counts["unknown"] += 1
+                continue
+            if norm_exchange(e["exchange"]) not in want_ex:
+                counts["other"] += 1
+                continue
+        if want_sec or want_ind:
+            if not e.get("sector") and not (want_ind and e.get("industry")):
+                counts["unknown"] += 1
+                continue
+            if want_sec and norm_sector(e.get("sector")) not in want_sec:
+                counts["other"] += 1
+                continue
+            ind = (e.get("industry") or "").lower()
+            if want_ind and not any(i in ind for i in want_ind):
+                counts["other"] += 1
+                continue
+        kept.append(sym)
+    counts["kept"] = len(kept)
+    return kept, counts
 
 
 # ---------------------------------------------------------------- daily setups
@@ -780,15 +954,45 @@ def read_symbols(a, offline_syms=None):
         if not os.path.exists(path):
             raise ScanError("no %s yet: run `scan.py universe` first, or pass --symbols" % path)
         syms = symbols_from_file(path)
-    out = []
+    out, seen = [], set()
     for s in syms:
-        if s not in out:
+        if s not in seen:
+            seen.add(s)
             out.append(s)
+    a.sector_filter = None
+    if a.sector or a.industry or a.exchange:
+        doc, table = load_sectors(a.sectors)
+        out, counts = filter_by_sector(out, table, split_list(a.sector), split_list(a.industry),
+                                       split_list(a.exchange))
+        a.sector_filter = {"sector": split_list(a.sector) or None, "industry": split_list(a.industry) or None,
+                           "exchange": split_list(a.exchange) or None, "sectors_file": a.sectors,
+                           "sectors_as_of": doc.get("created_at"), "counts": counts}
+        if not out:
+            known = sorted({e.get("sector") for e in table.values() if e.get("sector")})
+            raise ScanError("no symbol left after the sector / industry / exchange filter (%d in, %d unknown). "
+                            "Sectors in %s: %s." % (counts["in"], counts["unknown"], a.sectors, ", ".join(known)))
     if a.limit:
         out = out[:a.limit]
     if not out:
         raise ScanError("no symbols to scan")
     return out
+
+
+def sector_line(a):
+    f = getattr(a, "sector_filter", None)
+    if not f:
+        return None
+    c = f["counts"]
+    what = []
+    if f["sector"]:
+        what.append("sector " + " or ".join(f["sector"]))
+    if f["industry"]:
+        what.append("industry containing " + " or ".join(f["industry"]))
+    if f["exchange"]:
+        what.append("listed on " + " or ".join(f["exchange"]))
+    return ("Filter %s: %s of %s symbols kept, %s without the data needed (left out, not guessed); "
+            "sectors file of %s." % (", ".join(what), "{:,}".format(c["kept"]), "{:,}".format(c["in"]),
+                                     "{:,}".format(c["unknown"]), f["sectors_as_of"] or "unknown date"))
 
 
 def symbols_from_file(path):
@@ -856,7 +1060,11 @@ def cmd_universe(a):
                 raise ScanError("nasdaqtrader.com answered HTTP %d for %s" % (e.code, fname))
             except (urllib.error.URLError, OSError) as e:
                 raise ScanError("could not reach nasdaqtrader.com: %s" % getattr(e, "reason", e))
-    kept, counts, created = build_universe(texts)
+    exchanges = {}
+    kept, counts, created = build_universe(texts, exchanges)
+    sec_doc = sec_counts = None
+    if not a.no_sectors and kept:
+        sec_doc, sec_counts = universe_sectors(a, kept, exchanges)
     if not a.no_write:
         d = os.path.dirname(a.out)
         if d:
@@ -868,6 +1076,7 @@ def cmd_universe(a):
     if a.json:
         print(json.dumps({"count": len(kept), "rows": counts.get("rows", 0), "files_created": created,
                           "dropped": dropped, "out": None if a.no_write else a.out,
+                          "sectors": sec_counts, "sectors_out": None if a.no_write or not sec_doc else a.sectors_out,
                           "seconds": round(time.time() - t0, 1)}, indent=2))
     else:
         print("Nasdaq Trader symbol directories%s: %s rows." % (
@@ -877,7 +1086,129 @@ def cmd_universe(a):
                                       for k, v in sorted(dropped.items(), key=lambda kv: -kv[1])) + ".")
         if not a.no_write:
             print("Wrote %s (one SYMBOL|Name a line)." % a.out)
+        if sec_counts:
+            if sec_counts.get("screener_error"):
+                print("Nasdaq screener unavailable: %s." % sec_counts["screener_error"])
+            print("Sectors: %s from the Nasdaq screener, %s from SEC SIC codes, %s without a sector%s."
+                  % ("{:,}".format(sec_counts["screener"]), "{:,}".format(sec_counts["sec"]),
+                     "{:,}".format(sec_counts["no_sector"]),
+                     "" if a.sec_fallback else " (--sec-fallback tries the SEC for those)"))
+            if sec_counts.get("sec_failed"):
+                print("SEC: %s companies could not be read (%s)." % (
+                    "{:,}".format(sec_counts["sec_failed"]), sec_counts.get("sec_error") or "see --json"))
+            if not a.no_write:
+                print("Wrote %s (exchange, sector and industry by symbol)." % a.sectors_out)
+        elif sec_doc is None and not a.no_sectors:
+            print("No sectors file written: %s" % (getattr(a, "sector_error", None) or "no data"))
     return 0 if kept else 1
+
+
+def sec_get(url, ua):
+    req = urllib.request.Request(url, headers={"User-Agent": ua, "Accept": "application/json"})
+    with urllib.request.urlopen(req, timeout=30) as r:
+        return r.read().decode("utf-8", "replace")
+
+
+def sec_lookup(a, symbols):
+    """SIC code by symbol from the SEC: one tickers file, then one submissions file a company."""
+    ua = os.environ.get("SEC_USER_AGENT", "").strip()
+    if not a.offline and (not ua or "@" not in ua):
+        raise ScanError("--sec-fallback needs SEC_USER_AGENT set to your name or app and an email "
+                        '(the SEC asks every client to say who it is), e.g. "Jane Doe jane@example.com"')
+    if a.offline:
+        p = os.path.join(a.offline, "company_tickers_exchange.json")
+        if not os.path.exists(p):
+            raise ScanError("no company_tickers_exchange.json in %s" % a.offline)
+        with open(p, encoding="utf-8") as fh:
+            tick = json.load(fh)
+    else:
+        try:
+            tick = json.loads(sec_get(SEC_TICKERS_URL, ua))
+        except urllib.error.HTTPError as e:
+            raise ScanError("sec.gov answered HTTP %d for the tickers file" % e.code)
+        except (urllib.error.URLError, OSError, ValueError) as e:
+            raise ScanError("could not read sec.gov's tickers file: %s" % getattr(e, "reason", e))
+    fields = tick.get("fields") or []
+    try:
+        ic, it = fields.index("cik"), fields.index("ticker")
+    except ValueError:
+        raise ScanError("sec.gov's tickers file is not the shape this tool knows")
+    cik = {}
+    for row in tick.get("data") or []:
+        t = str(row[it] or "").upper().replace("-", ".")
+        if t and t not in cik:
+            cik[t] = int(row[ic])
+    out, failed, last = {}, 0, None
+    todo = [s for s in symbols if s in cik]
+    progress(a, "SEC: SIC codes for %d of %d symbols without a sector..." % (len(todo), len(symbols)))
+    for k, sym in enumerate(todo):
+        try:
+            if a.offline:
+                p = os.path.join(a.offline, "CIK%010d.json" % cik[sym])
+                with open(p, encoding="utf-8") as fh:
+                    sub = json.load(fh)
+            else:
+                if k:
+                    SLEEP(SEC_PAUSE)
+                sub = json.loads(sec_get(SEC_SUBMISSIONS_URL % cik[sym], ua))
+        except urllib.error.HTTPError as e:
+            failed, last = failed + 1, "HTTP %d" % e.code
+            continue
+        except (urllib.error.URLError, OSError, ValueError) as e:
+            failed, last = failed + 1, str(getattr(e, "reason", e))
+            continue
+        out[sym] = {"sic": str(sub.get("sic") or "") or None,
+                    "sic_description": (sub.get("sicDescription") or "").strip() or None}
+        if (k + 1) % 100 == 0:
+            progress(a, "  SEC: %d of %d" % (k + 1, len(todo)))
+    return out, failed, last
+
+
+def universe_sectors(a, kept, exchanges):
+    """Screener (and the SEC if asked) -> writes the sectors file. Returns (doc, counts);
+    (None, None) with a.sector_error when the screener could not be read."""
+    screener_src = "api.nasdaq.com screener (sector, industry)"
+    try:
+        if a.screener_file:
+            screener = read_screener_file(a.screener_file)
+            screener_src = "Nasdaq screener file %s (sector, industry)" % os.path.basename(a.screener_file)
+        elif a.offline:
+            p = os.path.join(a.offline, "screener.json")
+            if not os.path.exists(p):
+                raise ScanError("no screener.json in %s" % a.offline)
+            screener = parse_screener(_read_maybe_gz(p))
+        else:
+            try:
+                screener = parse_screener(http_get(SCREENER_URL, timeout=90, accept="application/json"))
+            except urllib.error.HTTPError as e:
+                raise ScanError("api.nasdaq.com answered HTTP %d" % e.code)
+            except (urllib.error.URLError, OSError) as e:
+                raise ScanError("could not reach api.nasdaq.com: %s" % getattr(e, "reason", e))
+    except ScanError as e:
+        a.sector_error = str(e)
+        if not a.sec_fallback:
+            a.sector_error += (" (download the CSV from nasdaq.com's stock screener page and pass "
+                               "--screener-file, or use --sec-fallback)")
+            return None, None
+        progress(a, "Nasdaq screener unavailable (%s): every sector comes from the SEC." % e)
+        screener, screener_src = {}, None
+    sec, sec_failed, sec_err = None, 0, None
+    if a.sec_fallback:
+        missing = [s for s, _ in kept if not (screener.get(s) or {}).get("sector")]
+        sec, sec_failed, sec_err = sec_lookup(a, missing)
+    table, counts = build_sectors(kept, exchanges, screener, sec)
+    counts["sec_failed"] = sec_failed
+    counts["sec_error"] = sec_err
+    counts["screener_error"] = getattr(a, "sector_error", None)
+    now = datetime.datetime.now(datetime.timezone.utc)
+    doc = {"created_by": "trader-scanner", "created_at": to_eastern(now).strftime("%Y-%m-%d %H:%M ET"),
+           "sources": ["nasdaqtrader.com symbol directories (exchange)"] + ([screener_src] if screener_src else [])
+           + (["data.sec.gov submissions (SIC code; Technology ranges only)"] if a.sec_fallback else []),
+           "note": "Sector labels follow the Nasdaq screener; other sources classify some companies differently.",
+           "counts": counts, "symbols": table}
+    if not a.no_write:
+        write_json(a.sectors_out, doc)
+    return doc, counts
 
 
 def cmd_daily(a):
@@ -899,6 +1230,8 @@ def cmd_daily(a):
            "as_of": as_of, "universe": len(symbols), "scanned": counts["scanned"], "failed": nfailed,
            "source": "yahoo", "filters": {"min_price": a.min_price, "min_volume": a.min_volume},
            "note": NOTE, "hits": hits}
+    if a.sector_filter:
+        doc["sector_filter"] = a.sector_filter
     if a.offline:
         doc["offline"] = os.path.basename(a.offline.rstrip("/"))
     if not a.no_write:
@@ -909,6 +1242,8 @@ def cmd_daily(a):
     local = to_eastern(now)
     print("Daily scan, %s ET, closes through %s (Yahoo spark, daily closes only)." % (
         local.strftime("%a %Y-%m-%d %H:%M"), last_date.isoformat() if last_date else "nothing"))
+    if sector_line(a):
+        print(sector_line(a))
     print("Fetched %s of %s charts%s. %s passed the liquidity filter ($%s+ and %s+ shares)%s; "
           "%s scanned." % ("{:,}".format(counts["fetched"]), "{:,}".format(len(symbols)),
                            (" (%s failed or had no data)" % "{:,}".format(nfailed)) if nfailed else "",
@@ -988,6 +1323,8 @@ def cmd_orb(a):
            "unconfirmed": counts["unconfirmed"], "source": "yahoo", "or_minutes": a.or_minutes,
            "interval": "%dm" % BAR_MIN,
            "filters": {"min_price": a.min_price, "min_volume": a.min_volume}, "note": NOTE, "hits": hits}
+    if a.sector_filter:
+        doc["sector_filter"] = a.sector_filter
     if a.offline:
         doc["offline"] = os.path.basename(a.offline.rstrip("/"))
     if not a.no_write:
@@ -997,6 +1334,8 @@ def cmd_orb(a):
         return 0 if hits else 1
     print("Opening-range breakout scan, %s %s ET: %d-minute range (9:30 to %s), 5-minute bars, Yahoo."
           % (day_label(day), clock_label(cutoff), a.or_minutes, clock_label(slot(day, a.or_minutes // BAR_MIN))))
+    if sector_line(a):
+        print(sector_line(a))
     print("Fetched %s of %s charts%s; %s usable%s; %s candidates, %s confirmed with real highs and lows."
           % ("{:,}".format(counts["fetched"]), "{:,}".format(len(symbols)),
              (" (%s failed or had no data)" % "{:,}".format(nfailed)) if nfailed else "",
@@ -1037,6 +1376,13 @@ def main(argv=None):
     p.add_argument("--no-write", action="store_true")
     p.add_argument("--pause", type=float, default=PAUSE)
     p.add_argument("--json", action="store_true")
+    p.add_argument("--sectors-out", default=DEFAULT_SECTORS, help="sectors file (default %s)" % DEFAULT_SECTORS)
+    p.add_argument("--no-sectors", action="store_true", help="skip the Nasdaq screener download")
+    p.add_argument("--screener-file", metavar="FILE",
+                   help="the CSV (or JSON) downloaded from nasdaq.com's stock screener, instead of the API")
+    p.add_argument("--sec-fallback", action="store_true",
+                   help="fill missing sectors from SEC SIC codes (needs SEC_USER_AGENT with an email)")
+    p.add_argument("--quiet", action="store_true")
 
     def common(p, min_price, min_volume):
         g = p.add_mutually_exclusive_group()
@@ -1054,6 +1400,10 @@ def main(argv=None):
         p.add_argument("--show", type=int, default=50, help="hits to print (all are written)")
         p.add_argument("--quiet", action="store_true")
         p.add_argument("--json", action="store_true")
+        p.add_argument("--sector", help='keep these sectors, comma-separated ("Technology"; tech is an alias)')
+        p.add_argument("--industry", help='keep industries containing this text ("semiconductor")')
+        p.add_argument("--exchange", help="keep symbols listed here: nasdaq, nyse, nyse-american, nyse-arca, cboe")
+        p.add_argument("--sectors", default=DEFAULT_SECTORS, help="sectors file (default %s)" % DEFAULT_SECTORS)
 
     p = sub.add_parser("daily", help="pre-market setups from daily closes")
     common(p, 5.0, 1000000)
